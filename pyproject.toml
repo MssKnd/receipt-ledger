@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "receipt-ledger"
+version = "0.1.0"
+description = "レシート画像 → MF クラウド会計 仕訳帳インポート CSV"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "pillow",
+    "pillow-heif",
+    "pdf2image",
+    "requests",
+]
+
+[project.scripts]
+receipt-ledger = "receipt_ledger.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["receipt_ledger*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

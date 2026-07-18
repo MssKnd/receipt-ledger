@@ -1,0 +1,47 @@
+# receipt-ledger 設定例。RECEIPT_LEDGER_CONFIG で指すか、NixOS module の
+# services.receipt-ledger.{accounts,settings} で生成する。
+#
+# 借方勘定科目ホワイトリスト: MF に実在する科目名だけを書くこと。
+# hints に含む語が レシートの店名/明細/category_hint にマッチした数が最大の
+# 科目が選ばれる。どれもマッチしなければ fallback_account (雑費) に落ちる。
+
+base_dir = "/data/nobackup/receipts"
+
+credit_account = "短期借入金"
+credit_sub_account = "立替者名"   # 例。実際の立替者名に置き換える
+fallback_account = "雑費"
+
+min_confidence = 0.55
+checksum_tolerance = 0.05
+
+ollama_base_url = "http://127.0.0.1:11435"
+ollama_model = "qwen2.5vl:7b"
+
+frankfurter_base_url = "https://api.frankfurter.app"
+
+# ntfy は systemd 側で secret ファイルから注入する想定 (ここには書かない)。
+# ntfy_url = "https://ntfy.example.com/your-topic"
+
+[[accounts]]
+account = "会議費"
+hints = ["カフェ", "コーヒー", "スターバックス", "ドトール", "喫茶", "食事", "ランチ"]
+
+[[accounts]]
+account = "新聞図書費"
+hints = ["書店", "書籍", "本", "ブックス", "Amazon", "Kindle"]
+
+[[accounts]]
+account = "旅費交通費"
+hints = ["タクシー", "JR", "電車", "地下鉄", "バス", "航空", "駐車", "交通", "Uber"]
+
+[[accounts]]
+account = "通信費"
+hints = ["携帯", "モバイル", "SIM", "通信", "インターネット", "ドコモ", "au", "ソフトバンク"]
+
+[[accounts]]
+account = "消耗品費"
+hints = ["文房具", "文具", "オフィス", "家電", "ヨドバシ", "ビックカメラ", "Amazon"]
+
+[[accounts]]
+account = "接待交際費"
+hints = ["居酒屋", "レストラン", "ディナー", "接待", "贈答", "ギフト"]
