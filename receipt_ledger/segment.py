@@ -30,8 +30,32 @@ _MAX_MASK_FRAC = 0.85
 # クロップの余白 (辺の長さに対する割合)。輪郭の食い込みで文字が欠けないように。
 _PAD_FRAC = 0.02
 # 1 検出領域が画像に占めてよい最大割合。これを超えたら隣接レシートの融合か
-# 背景の誤検出とみなし、分割を諦める。
+# 背景の誤検出とみなす (→ Canny パスへエスカレーション)。
 _MAX_RECT_FRAC = 0.5
+# パス 2 (Canny 切断) で許す最大領域数。これを超えたら印字を切った断片化。
+_MAX_REGIONS = 8
+
+
+def _detect_rects(m, erode_px: int, extra_pad: int = 0):
+    """マスクから (レシート矩形リスト, 融合blobの寸法 or None) を返す。
+
+    巨大領域 (画像の _MAX_RECT_FRAC 超) を見つけたら rects=None と
+    その (幅, 高さ) を返し、呼び出し側がエスカレーションを判断する。"""
+    erode_k = cv2.getStructuringElement(cv2.MORPH_RECT, (erode_px, erode_px))
+    eroded = cv2.erode(m, erode_k)
+    contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = _MIN_AREA_FRAC * m.size
+    max_area = _MAX_RECT_FRAC * m.size
+    restore = 2 * (erode_px + extra_pad)
+    rects = []
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            continue
+        (cx, cy), (rw, rh), angle = cv2.minAreaRect(c)
+        if rw * rh > max_area:
+            return None, (rw, rh)
+        rects.append(((cx, cy), (rw + restore, rh + restore), angle))
+    return rects, None
 
 
 def split_receipts(img: Image.Image) -> list[Image.Image]:
@@ -59,28 +83,27 @@ def split_receipts(img: Image.Image) -> list[Image.Image]:
     close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
 
-    # ほぼ接して並んだレシートの細い接続を erode で切り離す。矩形は後で
-    # erode 分ふくらませて戻すので、文字は欠けない。
+    # パス 1: erode で細い接続を切る (隣接だが密着していない配置向け)。
     erode_px = max(3, _DETECT_EDGE // 100)
-    erode_k = cv2.getStructuringElement(cv2.MORPH_RECT, (erode_px, erode_px))
-    eroded = cv2.erode(mask, erode_k)
+    rects, fused = _detect_rects(mask, erode_px)
 
-    contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = _MIN_AREA_FRAC * mask.size
-    max_area = _MAX_RECT_FRAC * mask.size
-    rects = []
-    for c in contours:
-        if cv2.contourArea(c) < min_area:
-            continue
-        (cx, cy), (rw, rh), angle = cv2.minAreaRect(c)
-        if rw * rh > max_area:
-            # 1 領域が画像の大半 = 融合か背景誤検出。分割は信用しない。
-            log.info("検出領域が大きすぎる (融合の疑い) — 分割せず丸ごと処理")
-            return []
-        # erode で削った分を戻す。
-        rects.append(((cx, cy), (rw + 2 * erode_px, rh + 2 * erode_px), angle))
-    if len(rects) < 2:
-        log.info("レシート領域を %d 件しか検出できず — 分割せず丸ごと処理", len(rects))
+    # パス 2: 完全密着で 1 blob に融合した場合、レシート境界の影/エッジを
+    # Canny で切ってから再検出する。境界線の無い単独レシートの接写を
+    # 刻まないよう、「融合 blob が横長」のときだけ発動する (密着は横並びが
+    # 実態。縦積みや接写は従来の丸ごと処理へ)。
+    if fused is not None and fused[0] > fused[1]:
+        edges = cv2.Canny(blur, 40, 120)
+        edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+        cut = cv2.bitwise_and(mask, cv2.bitwise_not(edges))
+        cut = cv2.morphologyEx(cut, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+        rects, fused = _detect_rects(cut, 8, extra_pad=3)
+        if rects is not None and len(rects) > _MAX_REGIONS:
+            # 断片化しすぎ = 境界でなく印字を切っている。信用しない。
+            rects = None
+
+    if rects is None or len(rects) < 2:
+        n = len(rects) if rects else 0
+        log.info("レシート領域を分割できず (%d 件/融合=%s) — 丸ごと処理", n, fused is not None)
         return []
 
     # 左上から読む順序に寄せる (中心座標で列→行ソート)。
