@@ -56,7 +56,13 @@ def extract(path: Path, config: Config) -> Extraction:
         images = to_base64_images(path, config.image_max_edge)
     except Exception as exc:  # PIL の UnidentifiedImageError, PDF 変換失敗など
         raise ExtractPermanentError(f"画像を読めない: {exc}") from exc
+    return extract_images(images, config)
 
+
+def extract_images(images: list[str], config: Config) -> Extraction:
+    """base64 画像リストを 1 回の抽出として Ollama に投げる。
+
+    セグメンテーション後のクロップ単位抽出はこちらを直接呼ぶ。"""
     payload = {
         "model": config.ollama_model,
         "format": extraction_json_schema(),

@@ -27,7 +27,13 @@ def _no_fx_network(monkeypatch):
 
 
 def _patch_extract(monkeypatch, receipts):
-    monkeypatch.setattr(pipeline, "extract", lambda path, config: Extraction(receipts=receipts))
+    # 丸ごと 1 ユニットの従来経路を再現 (画像読み込みとセグメンテーションを飛ばす)
+    monkeypatch.setattr(
+        pipeline, "_to_units", lambda path, config: [pipeline._Unit("", ["b64"])]
+    )
+    monkeypatch.setattr(
+        pipeline, "extract_images", lambda b64, config: Extraction(receipts=receipts)
+    )
 
 
 def _r(**kw) -> Receipt:
@@ -109,10 +115,13 @@ def test_empty_extraction_is_failed(config, monkeypatch):
 def test_ollama_down_is_retry_and_keeps_file(config, monkeypatch):
     from receipt_ledger.extract import ExtractTransientError
 
-    def boom(path, config):
+    def boom(b64, config):
         raise ExtractTransientError("Ollama 不達")
 
-    monkeypatch.setattr(pipeline, "extract", boom)
+    monkeypatch.setattr(
+        pipeline, "_to_units", lambda path, config: [pipeline._Unit("", ["b64"])]
+    )
+    monkeypatch.setattr(pipeline, "extract_images", boom)
     p = _mk_file(config)
     res = process_file(p, config)
     assert res.outcome == Outcome.RETRY
@@ -122,10 +131,13 @@ def test_ollama_down_is_retry_and_keeps_file(config, monkeypatch):
 def test_extract_permanent_error_is_failed(config, monkeypatch):
     from receipt_ledger.extract import ExtractPermanentError
 
-    def boom(path, config):
+    def boom(b64, config):
         raise ExtractPermanentError("スキーマ不一致")
 
-    monkeypatch.setattr(pipeline, "extract", boom)
+    monkeypatch.setattr(
+        pipeline, "_to_units", lambda path, config: [pipeline._Unit("", ["b64"])]
+    )
+    monkeypatch.setattr(pipeline, "extract_images", boom)
     p = _mk_file(config)
     res = process_file(p, config)
     assert res.outcome == Outcome.FAILED
@@ -211,3 +223,90 @@ def test_jpy_with_decimal_total_routes_to_review(config, monkeypatch):
     assert res.outcome == Outcome.REVIEW
     assert res.written_rows == 0
     assert any("小数" in x for x in res.reasons)
+
+
+# --- 複数ユニット (クロップ分割) ---
+
+
+def _crop_img():
+    from PIL import Image
+
+    return Image.new("RGB", (60, 100), "white")
+
+
+def _patch_units(monkeypatch, unit_receipts):
+    """label → 抽出結果 (レシート列 or 例外) のマップでユニット経路をモックする。"""
+    units = [
+        pipeline._Unit(label, [f"b64-{label}"], crop=_crop_img()) for label in unit_receipts
+    ]
+    monkeypatch.setattr(pipeline, "_to_units", lambda path, config: units)
+
+    def fake_extract(b64, config):
+        label = b64[0].removeprefix("b64-")
+        result = unit_receipts[label]
+        if isinstance(result, Exception):
+            raise result
+        return Extraction(receipts=result)
+
+    monkeypatch.setattr(pipeline, "extract_images", fake_extract)
+
+
+def test_bad_crop_does_not_block_siblings(config, monkeypatch):
+    # r2 だけ検算 NG → r2 のクロップのみ failed/、r1・r3 の行は書かれる
+    _patch_units(
+        monkeypatch,
+        {
+            "r1": [_r(total=1000)],
+            "r2": [_r(merchant="こわれた店", date=None)],
+            "r3": [_r(merchant="書店", total=2000, category_hint="書籍")],
+        },
+    )
+    p = _mk_file(config, "multi.jpg")
+    res = process_file(p, config)
+    assert res.outcome == Outcome.FAILED  # 失敗ユニットがあるので通知上は failed 扱い
+    assert res.written_rows == 2
+    assert (config.directories.failed / "multi-r2.jpg").exists()
+    assert not (config.directories.failed / "multi.jpg").exists()  # 元ファイルは巻き添えにならない
+    assert (config.directories.processed / "2024" / "multi.jpg").exists()
+    csv_path = monthly_csv_path(config.directories.csv, date(2024, 5, 10))
+    with open(csv_path, encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 2
+
+
+def test_transient_error_in_any_crop_retries_whole_file(config, monkeypatch):
+    from receipt_ledger.extract import ExtractTransientError
+
+    _patch_units(
+        monkeypatch,
+        {
+            "r1": [_r(total=1000)],
+            "r2": ExtractTransientError("Ollama 不達"),
+        },
+    )
+    p = _mk_file(config, "multi.jpg")
+    res = process_file(p, config)
+    assert res.outcome == Outcome.RETRY
+    assert res.written_rows == 0
+    assert p.exists()  # inbox に残る
+    assert not monthly_csv_path(config.directories.csv, date(2024, 5, 10)).exists()
+    assert not any(config.directories.failed.iterdir())  # クロップも保存されない
+
+
+def test_duplicate_crop_goes_to_review_others_written(config, monkeypatch):
+    # 事前に同一 (日付,金額,店名) の行を書いておく → r1 は重複、r2 は書かれる
+    from receipt_ledger.csvwriter import append_row
+
+    _patch_units(
+        monkeypatch,
+        {"r1": [_r(total=1000)], "r2": [_r(merchant="書店", total=2000, category_hint="書籍")]},
+    )
+    p = _mk_file(config, "multi.jpg")
+    pre = pipeline._build_row(_r(total=1000), config, "seed.jpg")[0]
+    append_row(config.directories.csv, pre)
+
+    res = process_file(p, config)
+    assert res.outcome == Outcome.REVIEW
+    assert res.written_rows == 1
+    assert (config.directories.review / "multi-r1.jpg").exists()
+    assert (config.directories.processed / "2024" / "multi.jpg").exists()

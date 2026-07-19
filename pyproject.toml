@@ -13,6 +13,8 @@ dependencies = [
     "pillow-heif",
     "pdf2image",
     "requests",
+    "opencv-python",
+    "numpy",
 ]
 
 [project.scripts]

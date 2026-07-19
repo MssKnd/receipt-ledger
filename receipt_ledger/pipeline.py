@@ -21,9 +21,11 @@ from .classify import classify
 from .config import Config
 from .csvwriter import JournalRow, append_rows
 from .dedup import is_duplicate
-from .extract import ExtractPermanentError, ExtractTransientError, extract
+from .extract import ExtractPermanentError, ExtractTransientError, extract_images
 from .fx import FxPermanentError, FxTransientError, to_jpy, yen
+from .images import encode_image, to_base64_images
 from .models import FX_CONVERTIBLE, Currency, Receipt
+from .segment import split_receipts
 from .validate import validate_receipt
 
 log = logging.getLogger("receipt_ledger.pipeline")
@@ -139,85 +141,168 @@ def _move(path: Path, dest_dir: Path, subdir_year: date | None = None) -> Path:
     return Path(shutil.move(str(path), str(dest)))
 
 
+@dataclass(eq=False)
+class _Unit:
+    """抽出の単位。クロップ 1 枚、または丸ごと 1 ファイル。"""
+
+    label: str  # "" = 丸ごと、"r1"… = クロップ
+    b64: list[str]
+    crop: object | None = None  # PIL.Image (クロップ時のみ)。隔離保存に使う
+
+    def source_name(self, path: Path) -> str:
+        return f"{path.name}#{self.label}" if self.label else path.name
+
+
+def _to_units(path: Path, config: Config) -> list[_Unit]:
+    """ファイルを抽出ユニットに分解する。
+
+    画像 (非 PDF) はセグメンテーションを試み、2 枚以上のレシート領域が
+    検出できたらクロップ単位。それ以外は従来どおり丸ごと 1 ユニット。"""
+    if config.image_segmentation and path.suffix.lower() != ".pdf":
+        from PIL import Image
+
+        with Image.open(path) as img:
+            crops = split_receipts(img)
+        if len(crops) >= 2:
+            return [
+                _Unit(f"r{i}", [encode_image(c, config.image_max_edge)], crop=c)
+                for i, c in enumerate(crops, 1)
+            ]
+    return [_Unit("", to_base64_images(path, config.image_max_edge))]
+
+
+def _save_crop(crop, dest_dir: Path, stem: str, label: str) -> None:
+    """隔離用にクロップ画像を書き出す (同名衝突は連番)。"""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{stem}-{label}.jpg"
+    n = 1
+    while dest.exists():
+        dest = dest_dir / f"{stem}-{label}__{n}.jpg"
+        n += 1
+    crop.save(dest, format="JPEG", quality=90)
+
+
 def process_file(path: Path, config: Config) -> FileResult:
     """1 ファイルを処理する。副作用: CSV 追記とファイル移動。
 
-    書き込みは 2 フェーズ: (1) 全レシートの換算・分類を終えて行を確定し、
-    (2) 重複でない行だけをまとめて追記する。為替の一時障害は必ず 1 行も書く前に
-    起きるので、RETRY 後の再実行で二重計上しない。"""
+    書き込みは 2 フェーズ: (1) 全ユニットの抽出・検算・換算・分類を終えて
+    行を確定し、(2) 重複でない行だけをまとめて追記する。一時障害 (Ollama/
+    為替) は必ず 1 行も書く前に起きるので、RETRY 後の再実行で二重計上しない。
+
+    複数レシート写真はクロップ単位のユニットに分割され、恒久的に処理できない
+    ユニットはクロップ画像として failed//review/ に隔離される (正常ユニットは
+    巻き添えにならない)。丸ごと 1 ユニットのときは従来どおりファイル自体を
+    failed//review/ に移す。"""
     dirs = config.directories
 
-    # --- 抽出 (Ollama) ---
+    # --- ユニット分解 (画像を読めない = 恒久障害) ---
     try:
-        extraction = extract(path, config)
-    except ExtractTransientError as exc:
-        log.warning("Ollama 一時障害、リトライに回す: %s (%s)", path.name, exc)
-        return FileResult(path, Outcome.RETRY, reasons=[str(exc)])
-    except ExtractPermanentError as exc:
-        log.error("抽出失敗 (恒久): %s (%s)", path.name, exc)
+        units = _to_units(path, config)
+    except Exception as exc:  # PIL の UnidentifiedImageError, PDF 変換失敗など
+        log.error("画像を読めない: %s (%s)", path.name, exc)
         _move(path, dirs.failed)
-        return FileResult(path, Outcome.FAILED, reasons=[f"抽出失敗: {exc}"])
+        return FileResult(path, Outcome.FAILED, reasons=[f"画像を読めない: {exc}"])
+    single = len(units) == 1
 
-    receipts = extraction.receipts
-    if not receipts:
-        _move(path, dirs.failed)
-        return FileResult(path, Outcome.EMPTY, reasons=["レシートを検出できなかった"])
+    # --- 抽出 + 検算 + 行確定 (ユニット毎)。一時障害は即 RETRY (書き込みゼロ) ---
+    unit_fail: list[tuple[_Unit, list[str]]] = []
+    unit_review: list[tuple[_Unit, list[str]]] = []
+    built: list[tuple[_Unit, list[tuple[JournalRow, bool, list[str]]]]] = []
+    empty = False
+    for u in units:
+        prefix = f"{u.label}: " if u.label else ""
+        try:
+            receipts = extract_images(u.b64, config).receipts
+        except ExtractTransientError as exc:
+            log.warning("Ollama 一時障害、リトライに回す: %s (%s)", path.name, exc)
+            return FileResult(path, Outcome.RETRY, reasons=[str(exc)])
+        except ExtractPermanentError as exc:
+            unit_fail.append((u, [f"{prefix}抽出失敗: {exc}"]))
+            continue
+        if not receipts:
+            unit_fail.append((u, [f"{prefix}レシートを検出できなかった"]))
+            empty = True
+            continue
 
-    # --- 検算: 1 つでも NG ならファイルごと failed に (CSV へは何も書かない) ---
-    fail_reasons: list[str] = []
-    for i, r in enumerate(receipts, 1):
-        v = validate_receipt(r, config)
-        if not v.ok:
-            fail_reasons.extend(f"レシート{i}: {reason}" for reason in v.reasons)
-    if fail_reasons:
-        _move(path, dirs.failed)
-        return FileResult(path, Outcome.FAILED, reasons=fail_reasons)
+        reasons = []
+        for i, r in enumerate(receipts, 1):
+            v = validate_receipt(r, config)
+            if not v.ok:
+                reasons.extend(f"{prefix}レシート{i}: {x}" for x in v.reasons)
+        if reasons:
+            unit_fail.append((u, reasons))
+            continue
 
-    # --- フェーズ 1: 全行を確定 (換算・分類)。ここでは 1 行も書かない ---
-    built: list[tuple[JournalRow, bool, list[str]]] = []
-    try:
-        for r in receipts:
-            built.append(_build_row(r, config, path.name))
-    except FxTransientError as exc:
-        # 為替 API が一時的に不達 → まだ何も書いていないので安全にリトライ。
-        log.warning("為替一時障害、リトライに回す: %s (%s)", path.name, exc)
-        return FileResult(path, Outcome.RETRY, reasons=[str(exc)])
-    except (FxPermanentError, PermanentReceiptError) as exc:
-        # 対応外通貨など。何度やっても直らないので failed へ。
-        log.error("換算不能 (恒久): %s (%s)", path.name, exc)
-        _move(path, dirs.failed)
-        return FileResult(path, Outcome.FAILED, reasons=[str(exc)])
-    except ReviewReceiptError as exc:
-        # まだ 1 行も書いていない。ファイルごと review へ回して人手確認。
-        log.warning("要人手確認 (換算せず): %s (%s)", path.name, exc)
-        _move(path, dirs.review)
-        return FileResult(path, Outcome.REVIEW, reasons=[str(exc)])
+        try:
+            rows = [_build_row(r, config, u.source_name(path)) for r in receipts]
+        except FxTransientError as exc:
+            # 為替 API が一時的に不達 → まだ何も書いていないので安全にリトライ。
+            log.warning("為替一時障害、リトライに回す: %s (%s)", path.name, exc)
+            return FileResult(path, Outcome.RETRY, reasons=[str(exc)])
+        except (FxPermanentError, PermanentReceiptError) as exc:
+            unit_fail.append((u, [f"{prefix}{exc}"]))
+            continue
+        except ReviewReceiptError as exc:
+            unit_review.append((u, [f"{prefix}{exc}"]))
+            continue
+        built.append((u, rows))
 
     # --- フェーズ 2: 重複を除いて、残りをまとめて追記 ---
     all_notes: list[str] = []
-    review_reasons: list[str] = []
     rows_to_write: list[JournalRow] = []
-    for row, _needs_review, notes in built:
-        all_notes.extend(notes)
-        if is_duplicate(dirs.csv, row.txn_date, row.amount_jpy, row.merchant):
-            review_reasons.append(
-                f"重複疑い: {row.merchant} {row.txn_date:%Y/%m/%d} {row.amount_jpy}円"
-            )
-            continue
-        rows_to_write.append(row)
+    for u, rows in built:
+        dup_reasons = []
+        for row, _needs_review, notes in rows:
+            all_notes.extend(notes)
+            if is_duplicate(dirs.csv, row.txn_date, row.amount_jpy, row.merchant):
+                dup_reasons.append(
+                    f"重複疑い: {row.merchant} {row.txn_date:%Y/%m/%d} {row.amount_jpy}円"
+                )
+                continue
+            rows_to_write.append(row)
+        if dup_reasons:
+            unit_review.append((u, dup_reasons))
 
     if rows_to_write:
         append_rows(dirs.csv, rows_to_write)
     written = len(rows_to_write)
 
-    if review_reasons:
-        _move(path, dirs.review)
-        return FileResult(
-            path, Outcome.REVIEW, written_rows=written, reasons=review_reasons + all_notes
-        )
+    fail_reasons = [r for _, rs in unit_fail for r in rs]
+    review_reasons = [r for _, rs in unit_review for r in rs]
 
-    _move(path, dirs.processed, subdir_year=_parse_date(receipts[0].date))
-    return FileResult(path, Outcome.WRITTEN, written_rows=written, reasons=all_notes)
+    # --- 隔離とファイル移動 ---
+    if single:
+        # 従来セマンティクス: ファイル自体を failed / review / processed へ。
+        if fail_reasons:
+            _move(path, dirs.failed)
+            outcome = Outcome.EMPTY if empty else Outcome.FAILED
+            return FileResult(path, outcome, written_rows=written, reasons=fail_reasons)
+        if review_reasons:
+            _move(path, dirs.review)
+            return FileResult(
+                path, Outcome.REVIEW, written_rows=written,
+                reasons=review_reasons + all_notes,
+            )
+        _move(path, dirs.processed, subdir_year=built[0][1][0][0].txn_date)
+        return FileResult(path, Outcome.WRITTEN, written_rows=written, reasons=all_notes)
+
+    # 複数ユニット: 不良クロップだけを隔離し、元ファイルは processed へ。
+    for u, _ in unit_fail:
+        _save_crop(u.crop, dirs.failed, path.stem, u.label)
+    for u, _ in unit_review:
+        _save_crop(u.crop, dirs.review, path.stem, u.label)
+    year = built[0][1][0][0].txn_date if built else date.today()
+    _move(path, dirs.processed, subdir_year=year)
+
+    if fail_reasons:
+        outcome = Outcome.FAILED
+    elif review_reasons:
+        outcome = Outcome.REVIEW
+    else:
+        outcome = Outcome.WRITTEN
+    return FileResult(
+        path, outcome, written_rows=written, reasons=fail_reasons + review_reasons + all_notes
+    )
 
 
 def _is_stable(path: Path, config: Config, sleep=time.sleep) -> bool:

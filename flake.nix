@@ -17,6 +17,9 @@
         ps.pillow-heif
         ps.pdf2image
         ps.requests
+        # 複数レシート写真のセグメンテーション (import 名は cv2)。numpy も使う。
+        ps.opencv4
+        ps.numpy
       ];
       # 追加のランタイム依存 (PDF 変換に poppler が要る)。
       runtimeDeps = pkgs: [ pkgs.poppler-utils ];
@@ -29,6 +32,10 @@
           src = ./.;
           build-system = [ pkgs.python3Packages.setuptools ];
           dependencies = pyDeps pkgs.python3Packages;
+          # nixpkgs の opencv4 は PyPI の "opencv-python" と dist 名が違い
+          # runtime deps チェックに落ちるので、メタデータ照合から除外する
+          # (実体は pyDeps の ps.opencv4 が提供する)。
+          pythonRemoveDeps = [ "opencv-python" ];
           nativeBuildInputs = [ pkgs.makeWrapper ];
           # PDF 変換の pdftoppm を PATH に載せる。
           postFixup = ''

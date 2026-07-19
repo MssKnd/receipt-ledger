@@ -27,6 +27,11 @@ from PIL import Image
 _MAX_EDGE = 2000
 
 
+def encode_image(img: Image.Image, max_edge: int = _MAX_EDGE) -> str:
+    """PIL Image を base64 JPEG に (クロップなどファイルを経由しない画像用)。"""
+    return _encode(img, max_edge)
+
+
 def _encode(img: Image.Image, max_edge: int = _MAX_EDGE) -> str:
     img = img.convert("RGB")
     w, h = img.size

@@ -61,6 +61,8 @@ class Config:
     # 画像の長辺 px。複数レシート1枚撮りは大きくすると読み分けが改善する
     # (遅くなる)。
     image_max_edge: int = 2000
+    # 複数レシート写真を OpenCV でレシート単位に分割してから抽出する。
+    image_segmentation: bool = True
 
     # 為替
     # 自動換算を許す通貨。行動圏の通貨だけに絞ると、VL モデルの通貨誤判定
@@ -153,6 +155,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         ollama_timeout_s=i("ollama_timeout_s", 300),
         ollama_num_ctx=i("ollama_num_ctx", 16384),
         image_max_edge=i("image_max_edge", 2000),
+        image_segmentation=bool(data.get("image_segmentation", True)),
         fx_currencies=tuple(data.get("fx_currencies", ["CAD", "USD"])),
         frankfurter_base_url=s("frankfurter_base_url", "https://api.frankfurter.app"),
         fx_cache_path=Path(s("fx_cache_path", str(base / ".fx-cache.json"))),
