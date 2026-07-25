@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 
 from .config import Config
@@ -32,28 +33,39 @@ class Classification:
     review_notes: list[str]
 
 
-def _pick_account(receipt: Receipt, config: Config) -> tuple[str, str, bool, str | None]:
-    """(科目, 補助科目, フォールバックか, note) を返す。"""
-    haystack = " ".join(
-        filter(
-            None,
-            [
-                receipt.merchant,
-                receipt.category_hint or "",
-                " ".join(li.description for li in receipt.line_items),
-            ],
-        )
-    )
+def _norm(s: str) -> str:
+    """マッチング用の正規化。大文字小文字と全角半角を無視する。
 
+    レジ印字は "RAMEN GOJIRO" のように大文字が多く、素の部分一致だと
+    ヒント "Ramen" を取りこぼす実測があった。"""
+    return unicodedata.normalize("NFKC", s).casefold()
+
+
+def _best_rule(config: Config, *parts: str):
+    """ヒントのマッチ数が最大の科目ルールを返す (マッチなしなら None)。"""
+    haystack = _norm(" ".join(p for p in parts if p))
     best = None
     best_score = 0
     for rule in config.accounts:
-        score = sum(1 for h in rule.hints if h and h in haystack)
+        score = sum(1 for h in rule.hints if h and _norm(h) in haystack)
         if score > best_score:
             best_score = score
             best = rule
+    return best
 
-    if best is None or best_score == 0:
+
+def _pick_account(receipt: Receipt, config: Config) -> tuple[str, str, bool, str | None]:
+    """(科目, 補助科目, フォールバックか, note) を返す。
+
+    まず店名 + category_hint (固定語彙) で判定し、決まらないときだけ明細の
+    品名まで見る。品名は業態ヒントと衝突しやすい (実測: DAISO の明細
+    "Grill Grate" が飲食店向けヒント "Grill" に命中して会議費に化けた) ので、
+    弱いシグナルとして最後に回す。"""
+    best = _best_rule(config, receipt.merchant, receipt.category_hint or "")
+    if best is None:
+        best = _best_rule(config, " ".join(li.description for li in receipt.line_items))
+
+    if best is None:
         return config.fallback_account, "", True, "科目を自動判定できずフォールバック"
     return best.account, best.sub_account, False, None
 

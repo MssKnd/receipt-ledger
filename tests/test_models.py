@@ -196,3 +196,24 @@ def test_currency_not_corrected_for_plain_jpy():
 def test_confidence_scale_normalization(raw, expected):
     r = Receipt(merchant="m", date="2026-07-15", total=100.0, confidence=raw)
     assert r.confidence == expected
+
+
+def test_category_hint_schema_is_enum():
+    # 自由記述だと語彙が安定しない実測 → スキーマの enum で生成側に強制する
+    schema = extraction_json_schema()
+    hint = schema["$defs"]["Receipt"]["properties"]["category_hint"]
+    alts = hint.get("anyOf", [])
+    enums = [alt for alt in alts if "enum" in alt or alt.get("const")]
+    assert enums, f"category_hint に enum が無い: {hint}"
+    assert "食事" in (enums[0].get("enum") or [enums[0].get("const")])
+
+
+def test_category_hint_out_of_vocabulary_coerced_to_none():
+    # モデルが enum 制約を外しても抽出全体は失敗させず、分類フォールバックに委ねる
+    r = Receipt(merchant="m", date="2026-07-15", total=100.0, confidence=0.9, category_hint="謎の語")
+    assert r.category_hint is None
+
+
+def test_category_hint_in_vocabulary_kept():
+    r = Receipt(merchant="m", date="2026-07-15", total=100.0, confidence=0.9, category_hint="食事")
+    assert r.category_hint == "食事"

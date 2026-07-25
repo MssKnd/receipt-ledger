@@ -73,3 +73,59 @@ def test_tax_mixed_needs_review(config):
         config,
     )
     assert c.needs_review
+
+
+def test_hint_match_ignores_case(config):
+    # レジ印字は大文字が多い ("RAMEN GOJIRO" 実測)。ヒント "Ramen" で拾える
+    c = classify(_receipt(merchant="RAMEN GOJIRO", currency=Currency.CAD), config)
+    assert c.debit_account == "会議費"
+    assert not c.needs_review
+
+
+def test_hint_match_ignores_width(config):
+    # 全角英字も NFKC 正規化でマッチする
+    c = classify(_receipt(merchant="ＲＡＭＥＮ ＧＯＪＩＲＯ"), config)
+    assert c.debit_account == "会議費"
+
+
+def test_line_items_do_not_override_category_hint():
+    # 実測: DAISO の明細 "Grill Grate" が飲食ヒント "Grill" に命中して
+    # 会議費に化けた。店名+category_hint で決まるなら明細は見ない
+    from receipt_ledger.config import AccountRule, Config
+    from receipt_ledger.models import LineItem
+
+    config2 = Config(
+        directories=None,
+        accounts=(
+            AccountRule("会議費", hints=("食事", "Grill")),
+            AccountRule("備品・消耗品費", hints=("消耗品",)),
+        ),
+        fallback_account="雑費",
+        fx_cache_path=None,
+        min_confidence=0.55,
+        checksum_tolerance=0.05,
+    )
+    c = classify(
+        _receipt(
+            merchant="DAISO",
+            currency=Currency.CAD,
+            category_hint="雑貨・消耗品",
+            line_items=[LineItem(description="Grill Grate That Prevent", amount=6.5)],
+        ),
+        config2,
+    )
+    assert c.debit_account == "備品・消耗品費"
+
+
+def test_line_items_used_when_name_and_hint_give_nothing(config):
+    from receipt_ledger.models import LineItem
+
+    c = classify(
+        _receipt(
+            merchant="無名の店",
+            currency=Currency.CAD,
+            line_items=[LineItem(description="コーヒー", amount=500)],
+        ),
+        config,
+    )
+    assert c.debit_account == "会議費"

@@ -22,7 +22,7 @@ def config(tmp_path: Path) -> Config:
     return Config(
         directories=dirs,
         accounts=(
-            AccountRule("会議費", hints=("カフェ", "コーヒー", "スターバックス", "食事")),
+            AccountRule("会議費", hints=("カフェ", "コーヒー", "スターバックス", "食事", "Ramen")),
             AccountRule("新聞図書費", hints=("書店", "書籍", "本")),
             AccountRule("旅費交通費", hints=("タクシー", "交通", "JR", "電車")),
         ),

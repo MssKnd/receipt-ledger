@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional, get_args
 
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
@@ -57,6 +57,29 @@ def _plausible_year(n: int) -> bool:
     判別できる。"""
     return date.today().year - 6 <= 2000 + n <= date.today().year
 
+
+# category_hint の固定語彙。自由記述だとモデルの出す語が安定せず (同じ店で
+# 「食事」だったり英語だったり)、科目ヒントに掛かるかが運任せになる実測が
+# あった。スキーマの enum にして Ollama の structured output に文法レベルで
+# 強制させる。語彙は設定側の科目ヒント語と部分一致で繋がるように選ぶ
+# (例: 「雑貨・消耗品」はヒント「消耗品」に掛かる)。
+CategoryHint = Literal[
+    "食事",
+    "カフェ",
+    "食料品",
+    "書籍",
+    "新聞",
+    "交通",
+    "宿泊",
+    "通信",
+    "文房具",
+    "家電",
+    "雑貨・消耗品",
+    "贈答",
+    "手数料",
+    "その他",
+]
+CATEGORY_HINTS = get_args(CategoryHint)
 
 # 通貨補正に使うカナダ住所の目印 (州略称・主要都市・国名)。
 _CANADA_ADDR = re.compile(
@@ -225,13 +248,26 @@ class Receipt(BaseModel):
                     self, "date", _iso(m.group(3), m.group(1), m.group(2))
                 )
         return self
-    category_hint: Optional[str] = Field(
+    category_hint: Optional[CategoryHint] = Field(
         default=None,
         description=(
-            "レシート内容から推測される費用の種類を表す短い日本語。"
-            "例: 食事, 書籍, 交通, 文房具, 通信。分類の材料に使う"
+            "レシートの業態に最も近い語を一覧から 1 つ選ぶ。"
+            "飲食店・ファストフードは「食事」、喫茶は「カフェ」、"
+            "スーパー・食材店は「食料品」、百均・生活雑貨は「雑貨・消耗品」。"
+            "どれにも当てはまらなければ「その他」"
         ),
     )
+
+    @field_validator("category_hint", mode="before")
+    @classmethod
+    def _coerce_category_hint(cls, v: object) -> object:
+        """語彙外の値は None に落とす (抽出全体を失敗させない)。
+
+        enum はスキーマ経由で生成側に強制されるが、モデル/Ollama が
+        constraint を外した場合でも分類がフォールバックに落ちるだけに留める。"""
+        if isinstance(v, str) and v not in CATEGORY_HINTS:
+            return None
+        return v
     confidence: float = Field(
         default=0.0,
         description="この抽出全体の確信度 0.0〜1.0。数字がぼやけて自信がないほど低く",
