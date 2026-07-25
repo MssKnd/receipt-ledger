@@ -145,9 +145,10 @@ def _move(path: Path, dest_dir: Path, subdir_year: date | None = None) -> Path:
 class _Unit:
     """抽出の単位。クロップ 1 枚、または丸ごと 1 ファイル。"""
 
-    label: str  # "" = 丸ごと、"r1"… = クロップ
+    label: str  # "" = 丸ごと、"r1"… = クロップ、"r1a"… = 再分割クロップ
     b64: list[str]
     crop: object | None = None  # PIL.Image (クロップ時のみ)。隔離保存に使う
+    refined: bool = False  # 再分割済み (これ以上再分割しない)
 
     def source_name(self, path: Path) -> str:
         return f"{path.name}#{self.label}" if self.label else path.name
@@ -159,16 +160,41 @@ def _to_units(path: Path, config: Config) -> list[_Unit]:
     画像 (非 PDF) はセグメンテーションを試み、2 枚以上のレシート領域が
     検出できたらクロップ単位。それ以外は従来どおり丸ごと 1 ユニット。"""
     if config.image_segmentation and path.suffix.lower() != ".pdf":
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         with Image.open(path) as img:
-            crops = split_receipts(img)
+            crops = split_receipts(ImageOps.exif_transpose(img))
         if len(crops) >= 2:
             return [
                 _Unit(f"r{i}", [encode_image(c, config.image_max_edge)], crop=c)
                 for i, c in enumerate(crops, 1)
             ]
     return [_Unit("", to_base64_images(path, config.image_max_edge))]
+
+
+def _refine_unit(u: _Unit, config: Config) -> list[_Unit] | None:
+    """抽出・検算に失敗したクロップの再分割 (融合クロップの自己修復)。
+
+    クロップに 2 枚のレシートが融合したまま残ると、VL モデルが隣の
+    レシートと明細・総額を混線させて検算 NG になる (実測: 密着した 2 枚で
+    片方の明細+もう片方の総額が 1 レシートに合成された)。失敗したクロップに
+    限り向き不問のエスカレーション付き再分割を試し、2 枚以上に割れたら
+    サブクロップとして抽出し直す。再帰は 1 段のみ。"""
+    if u.refined or u.crop is None:
+        return None
+    subs = split_receipts(u.crop, refine=True)
+    if len(subs) < 2:
+        return None
+    log.info("%s: 融合疑いのクロップを %d 枚に再分割してリトライ", u.label, len(subs))
+    return [
+        _Unit(
+            f"{u.label}{chr(96 + i)}",  # r3 → r3a, r3b, …
+            [encode_image(s, config.image_max_edge)],
+            crop=s,
+            refined=True,
+        )
+        for i, s in enumerate(subs, 1)
+    ]
 
 
 def _save_crop(crop, dest_dir: Path, stem: str, label: str) -> None:
@@ -209,7 +235,9 @@ def process_file(path: Path, config: Config) -> FileResult:
     unit_review: list[tuple[_Unit, list[str]]] = []
     built: list[tuple[_Unit, list[tuple[JournalRow, bool, list[str]]]]] = []
     empty = False
-    for u in units:
+    queue = list(units)
+    while queue:
+        u = queue.pop(0)
         prefix = f"{u.label}: " if u.label else ""
         try:
             receipts = extract_images(u.b64, config).receipts
@@ -217,9 +245,15 @@ def process_file(path: Path, config: Config) -> FileResult:
             log.warning("Ollama 一時障害、リトライに回す: %s (%s)", path.name, exc)
             return FileResult(path, Outcome.RETRY, reasons=[str(exc)])
         except ExtractPermanentError as exc:
+            if subs := _refine_unit(u, config):
+                queue.extend(subs)
+                continue
             unit_fail.append((u, [f"{prefix}抽出失敗: {exc}"]))
             continue
         if not receipts:
+            if subs := _refine_unit(u, config):
+                queue.extend(subs)
+                continue
             unit_fail.append((u, [f"{prefix}レシートを検出できなかった"]))
             empty = True
             continue
@@ -230,6 +264,9 @@ def process_file(path: Path, config: Config) -> FileResult:
             if not v.ok:
                 reasons.extend(f"{prefix}レシート{i}: {x}" for x in v.reasons)
         if reasons:
+            if subs := _refine_unit(u, config):
+                queue.extend(subs)
+                continue
             unit_fail.append((u, reasons))
             continue
 

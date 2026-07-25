@@ -19,7 +19,7 @@ try:  # pragma: no cover - 環境依存
 except Exception:  # pragma: no cover
     pass
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 # 長辺をこの px に縮小 (VL モデルの入力上限と速度のため)。複数レシートを
 # 1 枚に詰めた写真は解像度を上げると読み分けが改善する (遅くなる) —
@@ -33,6 +33,9 @@ def encode_image(img: Image.Image, max_edge: int = _MAX_EDGE) -> str:
 
 
 def _encode(img: Image.Image, max_edge: int = _MAX_EDGE) -> str:
+    # HEIC は pillow_heif が向きを解決済みだが、JPEG 直アップロードは EXIF の
+    # Orientation を適用しないと横倒し/逆さのまま渡ってしまう。
+    img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
     w, h = img.size
     scale = max_edge / max(w, h)

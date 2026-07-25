@@ -51,3 +51,32 @@ def test_rotated_receipts_are_deskewed():
     assert len(crops) == 2
     for c in crops:
         assert c.height >= c.width
+
+
+def _vertical_fused_pair():
+    """縦積みで密着した 2 枚 (境界は数 px の隙間のみ)。CLOSE で 1 blob に融合する。"""
+    img = Image.new("RGB", (900, 1400), (60, 45, 35))
+    d = ImageDraw.Draw(img)
+    d.rectangle([100, 60, 800, 660], fill=(245, 245, 240))
+    d.rectangle([100, 664, 800, 1264], fill=(245, 245, 240))
+    return img
+
+
+def test_vertical_fused_pair_falls_back_in_normal_mode():
+    # 縦積み融合はエスカレーションしない (接写の誤分割対策) → 丸ごと処理
+    assert split_receipts(_vertical_fused_pair()) == []
+
+
+def test_vertical_fused_pair_splits_in_refine_mode():
+    # refine (クロップ再分割) は向き不問で Canny エスカレーション → 2 枚に割れる
+    subs = split_receipts(_vertical_fused_pair(), refine=True)
+    assert len(subs) == 2
+
+
+def test_refine_drops_edge_sliver():
+    # クロップ端に隣のレシートの細い写り込み → refine は本体 2 枚だけ返す
+    img = _photo(
+        [(60, 60, 500, 700), (620, 60, 500, 700), (1180, 60, 40, 700)],
+        size=(1260, 830),
+    )
+    assert len(split_receipts(img, refine=True)) == 2

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from enum import Enum
 from typing import Optional
 
@@ -45,6 +46,16 @@ def _year(y: str) -> int:
     """2 桁年 (レジ印字の "26" 等) は 2000 年代として解釈する。"""
     n = int(y)
     return n + 2000 if n < 100 else n
+
+
+def _plausible_year(n: int) -> bool:
+    """2 桁数字を年と解釈してよいか。
+
+    レシートの取引日は過去数年〜今日に限られるので、今年以前の近傍だけを
+    年とみなす (未来は validate が弾くので年扱いしない)。これで
+    26-05-29 (YY-MM-DD) と 29-05-26 (DD-MM-YY) のどちらの端が年かを
+    判別できる。"""
+    return date.today().year - 6 <= 2000 + n <= date.today().year
 
 
 # 通貨補正に使うカナダ住所の目印 (州略称・主要都市・国名)。
@@ -157,6 +168,25 @@ class Receipt(BaseModel):
                 return _iso(m.group(3), b, a)
             if b > 12 and a <= 12:
                 return _iso(m.group(3), a, b)
+        # 26-05-29 (YY-MM-DD) / 13-05-26 (DD-MM-YY): 2 桁年のレジ印字を
+        # モデルが素通しする実例があった。どちらの端が年かは「今年の近傍か」
+        # (_plausible_year) で決める。両端とも年に見える稀なケースは誤読
+        # リスクを取らず素通し (validate で failed)。
+        m = re.search(r"(?<!\d)(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{1,2})(?!\d)", v)
+        if m:
+            a, b, c = (int(g) for g in m.groups())
+            ya, yc = _plausible_year(a), _plausible_year(c)
+            if ya and not yc and b <= 12 and c <= 31:
+                return _iso(2000 + a, b, c)
+            if yc and not ya:
+                if 12 < a <= 31 and b <= 12:
+                    return _iso(2000 + c, b, a)
+                if 12 < b <= 31 and a <= 12:
+                    return _iso(2000 + c, a, b)
+                if a <= 12 and b <= 12:
+                    # 月日が曖昧 → 4 桁年に展開して _resolve_ambiguous_date
+                    # (通貨で判断) へ委ねる。
+                    return f"{a:02d}-{b:02d}-{2000 + c}"
         return v
 
     @model_validator(mode="after")

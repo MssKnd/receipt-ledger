@@ -310,3 +310,85 @@ def test_duplicate_crop_goes_to_review_others_written(config, monkeypatch):
     assert res.written_rows == 1
     assert (config.directories.review / "multi-r1.jpg").exists()
     assert (config.directories.processed / "2024" / "multi.jpg").exists()
+
+
+# --- 融合クロップの再分割リトライ ---
+
+
+def _patch_resplit(monkeypatch, fused_crop, subs):
+    """r2 のクロップを refine で subs に分割させ、encode をラベル対応にする。"""
+    from receipt_ledger.models import LineItem
+
+    units = [
+        pipeline._Unit("r1", ["b64-r1"], crop=_crop_img()),
+        pipeline._Unit("r2", ["b64-r2"], crop=fused_crop),
+    ]
+    monkeypatch.setattr(pipeline, "_to_units", lambda path, config: units)
+    monkeypatch.setattr(
+        pipeline,
+        "split_receipts",
+        lambda img, refine=False: list(subs.values()) if img is fused_crop else [],
+    )
+    encode_map = {id(img): f"b64-{label}" for label, img in subs.items()}
+    monkeypatch.setattr(
+        pipeline, "encode_image", lambda img, max_edge: encode_map[id(img)]
+    )
+    # r2 は 2 枚のレシートの明細と総額を混線した抽出 → 検算 NG
+    mixed = _r(
+        merchant="混線",
+        total=2412.0,
+        line_items=[LineItem(description="saba box", amount=995.0)],
+    )
+    return {"b64-r1": [_r(total=1000)], "b64-r2": [mixed]}
+
+
+def test_fused_crop_is_resplit_and_recovered(config, monkeypatch):
+    # 融合クロップの検算 NG → refine 分割 → サブクロップで成功、行が揃う
+    from PIL import Image
+
+    from receipt_ledger.models import Extraction
+
+    fused = Image.new("RGB", (100, 60), "white")
+    subs = {
+        "r2a": Image.new("RGB", (50, 60), "white"),
+        "r2b": Image.new("RGB", (51, 60), "white"),
+    }
+    results = _patch_resplit(monkeypatch, fused, subs)
+    results["b64-r2a"] = [_r(merchant="書店", total=2000, category_hint="書籍")]
+    results["b64-r2b"] = [_r(merchant="喫茶", total=3000)]
+    monkeypatch.setattr(
+        pipeline, "extract_images", lambda b64, config: Extraction(receipts=results[b64[0]])
+    )
+
+    p = _mk_file(config, "multi.jpg")
+    res = process_file(p, config)
+    assert res.outcome == Outcome.WRITTEN
+    assert res.written_rows == 3
+    assert not any(config.directories.failed.iterdir())  # 融合クロップは隔離されない
+    assert (config.directories.processed / "2024" / "multi.jpg").exists()
+
+
+def test_resplit_subcrop_failure_isolated_without_loop(config, monkeypatch):
+    # 再分割後のサブクロップが失敗 → そのサブクロップだけ failed/ (再々分割はしない)
+    from PIL import Image
+
+    from receipt_ledger.models import Extraction
+
+    fused = Image.new("RGB", (100, 60), "white")
+    subs = {
+        "r2a": Image.new("RGB", (50, 60), "white"),
+        "r2b": Image.new("RGB", (51, 60), "white"),
+    }
+    results = _patch_resplit(monkeypatch, fused, subs)
+    results["b64-r2a"] = [_r(merchant="書店", total=2000, category_hint="書籍")]
+    results["b64-r2b"] = [_r(merchant="ぼやけ", confidence=0.1)]  # 低確信 → NG
+    monkeypatch.setattr(
+        pipeline, "extract_images", lambda b64, config: Extraction(receipts=results[b64[0]])
+    )
+
+    p = _mk_file(config, "multi.jpg")
+    res = process_file(p, config)
+    assert res.outcome == Outcome.FAILED
+    assert res.written_rows == 2  # r1 + r2a
+    assert (config.directories.failed / "multi-r2b.jpg").exists()
+    assert (config.directories.processed / "2024" / "multi.jpg").exists()

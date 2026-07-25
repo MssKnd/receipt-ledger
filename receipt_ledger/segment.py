@@ -32,20 +32,28 @@ _PAD_FRAC = 0.02
 # 1 検出領域が画像に占めてよい最大割合。これを超えたら隣接レシートの融合か
 # 背景の誤検出とみなす (→ Canny パスへエスカレーション)。
 _MAX_RECT_FRAC = 0.5
+# refine (クロップ再分割) 時の上限。2 枚入りクロップでは片方のレシート単体が
+# 5 割を超え得る (実測 0.55) ので緩める。
+_REFINE_MAX_RECT_FRAC = 0.75
+# refine 時、最大領域に対してこの割合未満の領域はクロップ端に写り込んだ
+# 隣のレシートの切れ端とみなして捨てる (実測: 面積比 0.07 の細片)。
+_REFINE_MIN_REL_AREA = 0.125
 # パス 2 (Canny 切断) で許す最大領域数。これを超えたら印字を切った断片化。
 _MAX_REGIONS = 8
 
 
-def _detect_rects(m, erode_px: int, extra_pad: int = 0):
+def _detect_rects(m, erode_px: int, extra_pad: int = 0, max_frac: float = _MAX_RECT_FRAC):
     """マスクから (レシート矩形リスト, 融合blobの寸法 or None) を返す。
 
     巨大領域 (画像の _MAX_RECT_FRAC 超) を見つけたら rects=None と
-    その (幅, 高さ) を返し、呼び出し側がエスカレーションを判断する。"""
+    その (幅, 高さ) を返し、呼び出し側がエスカレーションを判断する。
+    寸法は軸整列 bbox で返す: minAreaRect の (rw, rh) は angle≈±90° で
+    幅と高さが入れ替わり、横長 blob を縦長と誤判定した実測がある。"""
     erode_k = cv2.getStructuringElement(cv2.MORPH_RECT, (erode_px, erode_px))
     eroded = cv2.erode(m, erode_k)
     contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     min_area = _MIN_AREA_FRAC * m.size
-    max_area = _MAX_RECT_FRAC * m.size
+    max_area = max_frac * m.size
     restore = 2 * (erode_px + extra_pad)
     rects = []
     for c in contours:
@@ -53,16 +61,21 @@ def _detect_rects(m, erode_px: int, extra_pad: int = 0):
             continue
         (cx, cy), (rw, rh), angle = cv2.minAreaRect(c)
         if rw * rh > max_area:
-            return None, (rw, rh)
+            _, _, bw, bh = cv2.boundingRect(c)
+            return None, (bw, bh)
         rects.append(((cx, cy), (rw + restore, rh + restore), angle))
     return rects, None
 
 
-def split_receipts(img: Image.Image) -> list[Image.Image]:
+def split_receipts(img: Image.Image, refine: bool = False) -> list[Image.Image]:
     """写真をレシート単位のクロップ (傾き補正済み) に分割する。
 
     2 枚以上を検出できた場合のみクロップのリストを返す。分割しない方が
     よい場合 (検出 0〜1 枚・背景が明るい・輪郭が不明瞭) は [] を返す。
+
+    refine=True は「複数レシート写真から切ったクロップの再分割」用:
+    融合エスカレーション (Canny) を blob の向きに関係なく発動する。
+    単独レシートの接写を刻む懸念は元写真が複数枚である時点で薄い。
     """
     rgb = np.array(img.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -84,22 +97,32 @@ def split_receipts(img: Image.Image) -> list[Image.Image]:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
 
     # パス 1: erode で細い接続を切る (隣接だが密着していない配置向け)。
+    # 融合検知の閾値は refine でも緩めない (2 枚入りクロップの融合 blob は
+    # 5〜7 割にもなり、緩めると見逃してそのまま 1 rect 扱いになる)。
     erode_px = max(3, _DETECT_EDGE // 100)
     rects, fused = _detect_rects(mask, erode_px)
 
     # パス 2: 完全密着で 1 blob に融合した場合、レシート境界の影/エッジを
     # Canny で切ってから再検出する。境界線の無い単独レシートの接写を
     # 刻まないよう、「融合 blob が横長」のときだけ発動する (密着は横並びが
-    # 実態。縦積みや接写は従来の丸ごと処理へ)。
-    if fused is not None and fused[0] > fused[1]:
+    # 実態。縦積みや接写は従来の丸ごと処理へ)。refine 時は向きを問わない。
+    if fused is not None and (refine or fused[0] > fused[1]):
         edges = cv2.Canny(blur, 40, 120)
         edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
         cut = cv2.bitwise_and(mask, cv2.bitwise_not(edges))
         cut = cv2.morphologyEx(cut, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-        rects, fused = _detect_rects(cut, 8, extra_pad=3)
+        # 切断後の再検出のみ上限を緩める (refine 時): 2 枚入りクロップでは
+        # 片方のレシート単体が 5 割を超え得る (実測 0.55)。
+        max_frac = _REFINE_MAX_RECT_FRAC if refine else _MAX_RECT_FRAC
+        rects, fused = _detect_rects(cut, 8, extra_pad=3, max_frac=max_frac)
         if rects is not None and len(rects) > _MAX_REGIONS:
             # 断片化しすぎ = 境界でなく印字を切っている。信用しない。
             rects = None
+
+    if rects is not None and refine:
+        # クロップ端に写り込んだ隣のレシートの切れ端を捨てる。
+        largest = max((rw * rh for _, (rw, rh), _ in rects), default=0)
+        rects = [r for r in rects if r[1][0] * r[1][1] >= _REFINE_MIN_REL_AREA * largest]
 
     if rects is None or len(rects) < 2:
         n = len(rects) if rects else 0

@@ -104,6 +104,49 @@ def test_date_two_digit_year(raw, expected):
     assert r.date == expected
 
 
+@pytest.fixture
+def fixed_today(monkeypatch):
+    """2 桁年の判別 (_plausible_year) は今年に依存するので固定する。"""
+    from datetime import date as real_date
+
+    import receipt_ledger.models as models
+
+    class _FixedDate(real_date):
+        @classmethod
+        def today(cls):
+            return real_date(2026, 7, 25)
+
+    monkeypatch.setattr(models, "date", _FixedDate)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("26-05-29", "2026-05-29"),  # YY-MM-DD (Cactus Club レジ印字の実例)
+        ("DATE 26-05-29 TIME 6:33PM", "2026-05-29"),
+        ("13-05-26", "2026-05-13"),  # DD-MM-YY (日 > 12 で月日確定)
+        ("27-05-26", "2026-05-27"),
+        ("05-29-26", "2026-05-29"),  # MM-DD-YY
+        ("26/05/29", "2026-05-29"),
+        # 両端とも年に見える (26 と 25) → 誤読リスクを取らず素通し
+        ("26-05-25", "26-05-25"),
+    ],
+)
+def test_date_two_digit_year_numeric(fixed_today, raw, expected):
+    r = Receipt(merchant="m", date=raw, total=100.0, confidence=0.9)
+    assert r.date == expected
+
+
+def test_two_digit_year_ambiguous_month_day_resolved_by_currency(fixed_today):
+    # 05-06-26: 年は末尾と判るが月日が曖昧 → 4 桁年に展開して通貨で解決
+    from receipt_ledger.models import Currency
+
+    cad = Receipt(merchant="m", date="05-06-26", currency=Currency.CAD, total=10.0, confidence=0.9)
+    assert cad.date == "2026-05-06"  # 北米式 MM-DD
+    jpy = Receipt(merchant="m", date="05-06-26", total=100.0, confidence=0.9)
+    assert jpy.date == "05-06-2026"  # 判断材料なし → validate で弾かれる形のまま
+
+
 def test_currency_corrected_by_gst_label():
     # 日系海外店 (店名日本語) の JPY 誤判定を GST ラベルで補正
     from receipt_ledger.models import Currency
