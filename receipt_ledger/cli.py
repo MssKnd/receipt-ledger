@@ -1,8 +1,10 @@
 """コマンドライン入口。
 
-  receipt-ledger scan            inbox を 1 巡処理 (systemd から呼ぶ本命)
-  receipt-ledger process FILE    単一ファイルを処理 (デバッグ用)
-  receipt-ledger extract FILE    抽出結果 JSON を表示 (モデル確認用)
+  receipt-ledger scan                inbox を 1 巡処理 (systemd から呼ぶ本命)
+  receipt-ledger process FILE        単一ファイルを処理 (デバッグ用)
+  receipt-ledger extract FILE        抽出結果 JSON を表示 (モデル確認用)
+  receipt-ledger wise preview FILE   Wise 履歴の仕訳案を表示 (書き込みなし)
+  receipt-ledger wise import FILE    Wise 履歴を wise-YYYY-MM.csv へ追記
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ from .config import load_config
 from .extract import extract
 from .notify import notify
 from .pipeline import Outcome, process_file, scan
+from .wise import importer as wise_importer
+from .wise import report as wise_report
 
 
 def _setup_logging() -> None:
@@ -83,6 +87,30 @@ def cmd_extract(args) -> int:
     return 0
 
 
+def _wise_run(args, *, dry_run: bool) -> int:
+    config = load_config(args.config)
+    result = wise_importer.run(Path(args.file), config, dry_run=dry_run)
+    print(
+        wise_report.render(
+            result.written,
+            result.skipped,
+            already_imported=result.already_imported,
+            written_paths=result.paths,
+        )
+    )
+    return 0
+
+
+def cmd_wise_preview(args) -> int:
+    """仕訳案を表示するだけ。CSV には一切書かない。"""
+    return _wise_run(args, dry_run=True)
+
+
+def cmd_wise_import(args) -> int:
+    """wise-YYYY-MM.csv に追記する。取り込み済みの取引は自動で除外される。"""
+    return _wise_run(args, dry_run=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="receipt-ledger")
     p.add_argument("-c", "--config", help="設定 TOML パス (省略時は RECEIPT_LEDGER_CONFIG)")
@@ -98,6 +126,15 @@ def build_parser() -> argparse.ArgumentParser:
     ep = sub.add_parser("extract", help="抽出結果 JSON を表示")
     ep.add_argument("file")
     ep.set_defaults(func=cmd_extract)
+
+    wp = sub.add_parser("wise", help="Wise 取引履歴の取り込み")
+    wsub = wp.add_subparsers(dest="wise_cmd", required=True)
+    prev = wsub.add_parser("preview", help="仕訳案を表示 (CSV は書かない)")
+    prev.add_argument("file", help="Wise の transaction-history.csv")
+    prev.set_defaults(func=cmd_wise_preview)
+    imp = wsub.add_parser("import", help="wise-YYYY-MM.csv に追記")
+    imp.add_argument("file", help="Wise の transaction-history.csv")
+    imp.set_defaults(func=cmd_wise_import)
     return p
 
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -20,6 +20,37 @@ class AccountRule:
     account: str  # MF に実在する勘定科目名 (例: 会議費)
     sub_account: str = ""  # 補助科目 (任意)
     hints: tuple[str, ...] = ()  # この科目に寄せる判定ヒント語 (例: 飲食, カフェ)
+
+
+@dataclass(frozen=True)
+class MerchantRule:
+    """Wise の Target name から仕訳を決め打ちする上書きルール。
+
+    レシート側のヒント方式と違い、Wise の取引先文字列は Wise が正規化済みで
+    ぶれないので、店名を直接キーにできる。摘要も既存の手入力に合わせて
+    (例: Wise の表記 "Example Store Canada" を帳簿の "Example Store" に)
+    書き換えられるようにしている。
+    """
+
+    match: str  # Target name にこの語が含まれれば適用 (大小・全半角は無視)
+    account: str
+    sub_account: str = ""
+    summary: str = ""  # 空なら Target name をそのまま摘要にする
+
+
+@dataclass(frozen=True)
+class WiseConfig:
+    """Wise 経路の仕訳の形。レシート経路とは貸方が別なので独立して持つ。
+
+    既定値は次の複合仕訳を前提にしている:
+      借方 費用科目 / 借方 支払手数料(Wise) / 貸方 預け金(Wise)
+    """
+
+    credit_account: str = "預け金"
+    credit_sub_account: str = "Wise"
+    fee_account: str = "支払手数料"
+    fee_sub_account: str = "Wise"
+    merchants: tuple[MerchantRule, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -42,9 +73,12 @@ class Config:
     credit_account: str = "短期借入金"
     credit_sub_account: str = ""  # 立替者名など。デプロイ側で設定する
 
-    # 借方推定
+    # 借方推定 (レシート・Wise 共通のホワイトリスト)
     accounts: tuple[AccountRule, ...] = ()
     fallback_account: str = "雑費"
+
+    # Wise 経路 (貸方が預け金なのでレシートの credit_account とは別立て)
+    wise: WiseConfig = field(default_factory=WiseConfig)
 
     # 確信度がこれ未満なら failed/ に隔離
     min_confidence: float = 0.55
@@ -133,6 +167,23 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         for a in data.get("accounts", [])
     )
 
+    wise_data = data.get("wise", {})
+    wise = WiseConfig(
+        credit_account=wise_data.get("credit_account", "預け金"),
+        credit_sub_account=wise_data.get("credit_sub_account", "Wise"),
+        fee_account=wise_data.get("fee_account", "支払手数料"),
+        fee_sub_account=wise_data.get("fee_sub_account", "Wise"),
+        merchants=tuple(
+            MerchantRule(
+                match=m["match"],
+                account=m["account"],
+                sub_account=m.get("sub_account", ""),
+                summary=m.get("summary", ""),
+            )
+            for m in wise_data.get("merchants", [])
+        ),
+    )
+
     def s(key: str, default: str) -> str:
         return str(os.environ.get(f"RECEIPT_LEDGER_{key.upper()}", data.get(key, default)))
 
@@ -148,6 +199,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         credit_sub_account=s("credit_sub_account", ""),
         accounts=accounts,
         fallback_account=s("fallback_account", "雑費"),
+        wise=wise,
         min_confidence=f("min_confidence", 0.55),
         checksum_tolerance=f("checksum_tolerance", 0.05),
         ollama_base_url=s("ollama_base_url", "http://127.0.0.1:11435"),

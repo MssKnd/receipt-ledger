@@ -33,21 +33,24 @@ class Classification:
     review_notes: list[str]
 
 
-def _norm(s: str) -> str:
+def normalize(s: str) -> str:
     """マッチング用の正規化。大文字小文字と全角半角を無視する。
 
     レジ印字は "RAMEN GOJIRO" のように大文字が多く、素の部分一致だと
-    ヒント "Ramen" を取りこぼす実測があった。"""
+    ヒント "Ramen" を取りこぼす実測があった。Wise の取引先文字列にも同じ
+    正規化を使うので公開している。"""
     return unicodedata.normalize("NFKC", s).casefold()
 
 
-def _best_rule(config: Config, *parts: str):
-    """ヒントのマッチ数が最大の科目ルールを返す (マッチなしなら None)。"""
-    haystack = _norm(" ".join(p for p in parts if p))
+def best_rule(config: Config, *parts: str):
+    """ヒントのマッチ数が最大の科目ルールを返す (マッチなしなら None)。
+
+    レシート経路と Wise 経路で共通の借方ホワイトリスト判定。"""
+    haystack = normalize(" ".join(p for p in parts if p))
     best = None
     best_score = 0
     for rule in config.accounts:
-        score = sum(1 for h in rule.hints if h and _norm(h) in haystack)
+        score = sum(1 for h in rule.hints if h and normalize(h) in haystack)
         if score > best_score:
             best_score = score
             best = rule
@@ -61,9 +64,9 @@ def _pick_account(receipt: Receipt, config: Config) -> tuple[str, str, bool, str
     品名まで見る。品名は業態ヒントと衝突しやすい (実測: DAISO の明細
     "Grill Grate" が飲食店向けヒント "Grill" に命中して会議費に化けた) ので、
     弱いシグナルとして最後に回す。"""
-    best = _best_rule(config, receipt.merchant, receipt.category_hint or "")
+    best = best_rule(config, receipt.merchant, receipt.category_hint or "")
     if best is None:
-        best = _best_rule(config, " ".join(li.description for li in receipt.line_items))
+        best = best_rule(config, " ".join(li.description for li in receipt.line_items))
 
     if best is None:
         return config.fallback_account, "", True, "科目を自動判定できずフォールバック"
