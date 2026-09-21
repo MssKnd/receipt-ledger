@@ -174,12 +174,14 @@ class Receipt(BaseModel):
         m = re.search(r"(\d{4})[年/\-.](\d{1,2})[月/\-.](\d{1,2})", v)
         if m:
             return _iso(m.group(1), m.group(2), m.group(3))
-        # 01-Feb-2026 / 1 Feb 2026 (年は 2 桁もある: "28 Jun 26")
-        m = re.search(r"(\d{1,2})[ \-/]([A-Za-z]{3,9})[ \-/,]+(\d{2,4})\b", v)
+        # 01-Feb-2026 / 1 Feb 2026 (年は 2 桁もある: "28 Jun 26")。月名の省略形に
+        # ピリオドが付く表記 ("29-Dec.-2025") にも対応。
+        m = re.search(r"(\d{1,2})[ \-/]([A-Za-z]{3,9})\.?[ \-/,]+(\d{2,4})\b", v)
         if m and _month(m.group(2)):
             return _iso(_year(m.group(3)), _month(m.group(2)), m.group(1))
-        # Feb 10, 2026 / Feb 10,2026 / Jun 28, 26
-        m = re.search(r"([A-Za-z]{3,9})[ \-/]+(\d{1,2})[ ,/\-]+(\d{2,4})\b", v)
+        # Feb 10, 2026 / Feb 10,2026 / Jun 28, 26 / Aug, 26, 2023 (月名の直後に
+        # カンマが来る表記もある)
+        m = re.search(r"([A-Za-z]{3,9})\.?[ \-/,]+(\d{1,2})[ ,/\-]+(\d{2,4})\b", v)
         if m and _month(m.group(1)):
             return _iso(_year(m.group(3)), _month(m.group(1)), m.group(2))
         # 25-12-2026 / 12-25-2026: 13 以上の成分がある場合だけ月日を確定できる。
