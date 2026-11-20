@@ -45,3 +45,36 @@ hints = ["文房具", "文具", "オフィス", "家電", "ヨドバシ", "ビ�
 [[accounts]]
 account = "接待交際費"
 hints = ["居酒屋", "レストラン", "ディナー", "接待", "贈答", "ギフト"]
+
+# --- Wise 取引履歴の取り込み ---
+#
+# レシートとは貸方が違う (レシート = 立替 → 短期借入金、Wise = 預け金) ので
+# 別立てにしている。仕訳は必ず複合仕訳になる:
+#   借方 費用科目 / 借方 支払手数料(Wise) / 貸方 預け金(Wise)
+#
+# Wise は円残高から決済時に都度両替する運用なので円額は Wise 側で確定済み。
+# Frankfurter による換算は通らないし、外貨残高を持たない限り為替差損益も出ない。
+
+[wise]
+credit_account = "預け金"
+credit_sub_account = "Wise"
+fee_account = "支払手数料"
+fee_sub_account = "Wise"
+
+# Wise の取引先文字列 (Target name) は Wise が正規化済みでぶれないので、
+# レシートのヒント方式ではなく店名を直接キーにできる。summary を書くと摘要を
+# 差し替える (Wise の表記を帳簿の表記に揃えるのに使う)。
+# ここに無い取引先は上の accounts ホワイトリストに掛かるが、日本語のヒントは
+# 英語の取引先名に対して根拠が弱いので「要確認」が付く。どれも当たらなければ
+# fallback_account に落ちる。実際に使う取引先は import 側の設定で管理すること。
+
+# [[wise.merchants]]
+# match = "Example Store Canada"
+# account = "備品・消耗品費"
+# summary = "Example Store"
+
+# [[wise.merchants]]
+# match = "Example SaaS"
+# account = "支払手数料"
+# sub_account = "Example SaaS"
+# summary = "月額サブスクリプション"

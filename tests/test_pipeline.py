@@ -91,7 +91,7 @@ def test_cad_conversion_in_summary(config, monkeypatch):
         row = next(csv.DictReader(fh))
     assert row["借方金額(円)"] == str(round(12.34 * 100.0))
     assert row["借方税区分"] == "対象外"
-    assert "CAD 12.34 @100" in row["メモ"]
+    assert "CAD 12.34 @100" in row["仕訳メモ"]
 
 
 def test_duplicate_routes_to_review(config, monkeypatch):
@@ -193,7 +193,7 @@ def test_needs_review_marks_summary_but_writes(config, monkeypatch):
     with open(csv_path, encoding="utf-8-sig", newline="") as fh:
         row = next(csv.DictReader(fh))
     assert row["借方勘定科目"] == "雑費"
-    assert "要確認" in row["メモ"]
+    assert "要確認" in row["仕訳メモ"]
 
 
 def test_disallowed_currency_routes_to_review(config, monkeypatch):
